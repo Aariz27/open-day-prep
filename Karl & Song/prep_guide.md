@@ -1,6 +1,6 @@
-# System 2: Indexing & Retrieval — Preparation Guide
+# System 1: Data Collection & Embedding Generation — Preparation Guide
 
-**For: Bessie & Zheng**
+**For: Karl & Song**
 **Prepared by: Aariz**
 
 ---
@@ -13,358 +13,303 @@ You are responsible for understanding these files. Read every line.
 
 | File | Lines | What It Does |
 |:---|:---|:---|
-| `server/app/services/search_service.py` | 147 | The hybrid search algorithm, LanceDB table management, vector comparison |
-| `server/app/routers/search.py` | 80 | Search API endpoint, score rescaling, the `/images/all` listing endpoint |
-| `server/app/services/ingestion_service.py` | 184 | Database schema (`ImageRecord`), record insertion (`_insert_records`), IVF-PQ index creation (`_maybe_create_index`) |
+| `server/app/services/search_service.py` | 147 | CLIP model loading, text/image embedding, LRU cache, batch embedding |
+| `server/app/services/caption_service.py` | 41 | BLIP model loading, image captioning |
+| `server/app/services/ingestion_service.py` | 184 | The pipeline that ties everything together — upload processing, schema definition, bulk ingestion |
 
 ### Supporting Files (you should be familiar with these)
 
 | File | Lines | Why It Matters to You |
 |:---|:---|:---|
-| `server/app/main.py` | 58 | Server startup — restores LanceDB data from HF repo, mounts static files |
-| `server/app/routers/upload.py` | 66 | Upload endpoints that trigger database writes |
-| `client/app/page.tsx` | 310 | Frontend search UI — sends queries to your search endpoint, displays your results |
-| `client/lib/api.ts` | 97 | API client — shows how the frontend calls your endpoints |
-| `client/app/admin/page.tsx` | 419 | Admin panel — the "All Images" gallery tab calls your `/images/all` endpoint |
+| `server/app/main.py` | 58 | Server startup — loads CLIP at boot, restores data from HF repo |
+| `server/app/routers/upload.py` | 66 | The API endpoints that trigger your ingestion pipeline |
+| `client/app/admin/page.tsx` | 419 | The admin panel UI — where uploads happen and captions display |
 
 ---
 
 ## Relevant Code Sections (In Detail)
 
-### A. Database Schema (`ingestion_service.py`, lines 18-23)
+### A. CLIP Model Initialisation (`search_service.py`, lines 19-33)
+
+```python
+self.model_name = os.getenv("EMBED_MODEL", "openai/clip-vit-base-patch32")
+self.device = "cuda" if torch.cuda.is_available() else "cpu"
+self._text_cache = OrderedDict()  # LRU cache for text embeddings
+self._text_cache_max = 128
+self.model = CLIPModel.from_pretrained(self.model_name).to(self.device)
+self.processor = CLIPProcessor.from_pretrained(self.model_name)
+self.model.eval()
+```
+
+- The model is `openai/clip-vit-base-patch32` — a Vision Transformer (ViT) with 32x32 patch size
+- Runs on GPU if available, CPU otherwise (our deployment is CPU-only)
+- `model.eval()` disables dropout — we only do inference, never training
+- The LRU cache stores up to 128 text embeddings to avoid re-computing repeated queries
+
+### B. Text Embedding with LRU Cache (`search_service.py`, lines 50-70)
+
+```python
+@torch.no_grad()
+def embed_text(self, text: str) -> np.ndarray:
+    cache_key = text.strip().lower()
+    if cache_key in self._text_cache:
+        self._text_cache.move_to_end(cache_key)
+        return self._text_cache[cache_key]
+
+    inputs = self.processor(text=[text], return_tensors="pt", padding=True, truncation=True).to(self.device)
+    text_features = self.model.get_text_features(**inputs)
+    if hasattr(text_features, "pooler_output"):
+        text_features = text_features.pooler_output
+    text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+    result = text_features.cpu().numpy().astype("float32")[0]
+
+    self._text_cache[cache_key] = result
+    if len(self._text_cache) > self._text_cache_max:
+        self._text_cache.popitem(last=False)
+    return result
+```
+
+- `@torch.no_grad()` disables gradient tracking — saves ~50% memory, ~20% faster
+- Cache key is normalised: "Sunset", "sunset", " SUNSET " all map to the same entry
+- `move_to_end()` marks a cache entry as recently used (LRU policy)
+- `popitem(last=False)` evicts the least recently used entry when cache is full
+- L2 normalisation (`/ norm()`) ensures all vectors have unit length — required for cosine similarity
+- `pooler_output` handling is a compatibility fix for different `transformers` library versions
+
+### C. Image Embedding (`search_service.py`, lines 72-81)
+
+```python
+@torch.no_grad()
+def embed_image(self, image: Image.Image) -> np.ndarray:
+    inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+    image_features = self.model.get_image_features(**inputs)
+    if hasattr(image_features, "pooler_output"):
+        image_features = image_features.pooler_output
+    image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+    return image_features.cpu().numpy().astype("float32")[0]
+```
+
+- Same model, different method: `get_image_features()` vs `get_text_features()`
+- CLIP's architecture has two encoders: a Vision Transformer for images, a text Transformer for text
+- Both produce 512-dimensional vectors in the SAME space — that is what makes cross-modal search possible
+
+### D. Batch Image Embedding (`search_service.py`, lines 84-97)
+
+```python
+@torch.no_grad()
+def embed_images_batch(self, images: list[Image.Image], batch_size: int = 16) -> list[np.ndarray]:
+    all_vectors = []
+    for i in range(0, len(images), batch_size):
+        batch = images[i:i + batch_size]
+        inputs = self.processor(images=batch, return_tensors="pt", padding=True).to(self.device)
+        image_features = self.model.get_image_features(**inputs)
+        image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+        vectors = image_features.cpu().numpy().astype("float32")
+        all_vectors.extend([vectors[j] for j in range(len(batch))])
+    return all_vectors
+```
+
+- Processes 16 images at once through CLIP instead of one at a time
+- The Transformer architecture benefits from batching — per-image cost drops significantly
+- Used during bulk CSV ingestion (1000+ images at a time)
+
+### E. BLIP Caption Service (`caption_service.py`, entire file)
+
+```python
+class CaptionService:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(CaptionService, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def _ensure_loaded(self):
+        if self._initialized:
+            return
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        self.model_name = "Salesforce/blip-image-captioning-base"
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = BlipProcessor.from_pretrained(self.model_name)
+        self.model = BlipForConditionalGeneration.from_pretrained(self.model_name).to(self.device)
+        self.model.eval()
+        self._initialized = True
+
+    @torch.no_grad()
+    def generate_caption(self, image: Image.Image) -> str:
+        self._ensure_loaded()
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        out = self.model.generate(**inputs)
+        caption = self.processor.decode(out[0], skip_special_tokens=True)
+        return caption
+```
+
+- Singleton pattern (`__new__` override) — only one ~990MB model in memory
+- Lazy loading (`_ensure_loaded`) — the model does NOT load at server startup, only when the first caption is requested. This cuts cold start time from ~60s to ~30s for search-only sessions.
+- The `from transformers import ...` is INSIDE `_ensure_loaded()`, not at the top of the file — even the import is deferred because `transformers` is slow to import
+- RGB conversion guard — BLIP crashes on RGBA/palette-mode images without this
+- `model.generate()` is autoregressive — it produces tokens one at a time until it generates a stop token
+
+### F. ImageRecord Schema (`ingestion_service.py`, lines 18-23)
 
 ```python
 class ImageRecord(LanceModel):
-    photo_id: str                  # Unique identifier (filename stem or CSV ID)
-    photo_image_url: str           # Relative path: "/images/filename.jpg"
-    description: str = ""          # BLIP-generated caption text
-    vector: Vector(512)            # CLIP image embedding (512 floats)
-    caption_vector: Vector(512)    # CLIP text embedding of the BLIP caption (512 floats)
+    photo_id: str
+    photo_image_url: str
+    description: str = ""
+    vector: Vector(512)
+    caption_vector: Vector(512)
 ```
 
-- This is a Pydantic model that doubles as a LanceDB schema (via `LanceModel`)
-- `Vector(512)` tells LanceDB to store a fixed-size array of 512 float32 values
-- Two vector columns enable dual-pathway hybrid search
-- `description` defaults to empty string — bulk-ingested images without captions have `""` here and a zero vector for `caption_vector`
+- This is the database schema. Every image has these 5 fields.
+- `vector` = CLIP image embedding (512 floats)
+- `caption_vector` = CLIP text embedding of the BLIP caption (512 floats)
+- `description` = the BLIP caption string (e.g., "a couple of elephants walking down a dirt road")
 
-### B. Record Insertion (`ingestion_service.py`, lines 151-158)
-
-```python
-def _insert_records(self, records: List[ImageRecord]):
-    db = lancedb.connect(search_service.db_uri)
-    try:
-        table = db.open_table("images")
-        table.add(records)
-    except:
-        db.create_table("images", schema=ImageRecord, data=records)
-    search_service.refresh_table()
-```
-
-- First attempts to open existing "images" table and add records
-- If the table doesn't exist yet, creates it with the ImageRecord schema
-- `refresh_table()` updates the SearchService's reference to the table so new data is immediately searchable
-- `lancedb.connect()` takes a URI — local path for development, `/data/lancedb_db` in production
-
-### C. IVF-PQ Index Creation (`ingestion_service.py`, lines 160-180)
+### G. Single Image Upload Pipeline (`ingestion_service.py`, lines 42-68)
 
 ```python
-def _maybe_create_index(self, min_rows: int = 256):
-    try:
-        table = search_service.table
-        if table is None:
-            return
-        row_count = table.count_rows()
-        if row_count < min_rows:
-            print(f"Skipping index creation: {row_count} rows < {min_rows} minimum")
-            return
-        num_partitions = max(2, int(row_count ** 0.5))
-        num_sub_vectors = 16
-        print(f"Building IVF-PQ index: {row_count} rows, {num_partitions} partitions, {num_sub_vectors} sub-vectors...")
-        table.create_index(
-            metric="cosine",
-            num_partitions=num_partitions,
-            num_sub_vectors=num_sub_vectors,
-            replace=True,
-        )
-        print("IVF-PQ index built successfully.")
-    except Exception as e:
-        print(f"Index creation skipped or failed: {e}")
-```
+def process_upload(self, file_contents: bytes, filename: str):
+    file_path = self.data_dir / filename
+    with open(file_path, "wb") as f:
+        f.write(file_contents)
 
-- Called after bulk CSV ingestion only (not after single uploads — too few records to justify)
-- `min_rows=256`: below this threshold, brute-force scanning is faster than index overhead
-- `num_partitions = sqrt(row_count)`: a standard heuristic — balances granularity vs overhead
-- `num_sub_vectors = 16`: each 512-dim vector is split into 16 groups of 32 dimensions for compression
-- `metric="cosine"`: must match the metric used in search queries
-- `replace=True`: rebuilds the index if one already exists (important after adding more data)
+    img = Image.open(file_path).convert("RGB")
 
-### D. LanceDB Table Management (`search_service.py`, lines 35-48)
+    vector = search_service.embed_image(img)                 # Step 1: CLIP image → vector
+    description = caption_service.generate_caption(img)      # Step 2: BLIP image → caption
+    caption_vector = search_service.embed_text(description)  # Step 3: CLIP text → vector
 
-```python
-def refresh_table(self):
-    try:
-        db = lancedb.connect(self.db_uri)
-        self.table = db.open_table("images")
-        print(f"Table loaded: {self.table.count_rows()} rows")
-    except Exception:
-        self.table = None
-        print("No existing table found.")
-```
-
-- Called at startup and after every record insertion
-- `self.table` is the live reference used by the `search()` method
-- If no table exists yet (fresh server), `self.table = None` and search returns empty results
-
-### E. Hybrid Search Algorithm (`search_service.py`, lines 99-144)
-
-```python
-def search(self, query: str, k: int = 20, threshold: float = 0.9):
-    if self.table is None:
-        self.refresh_table()
-        if self.table is None:
-            return []
-
-    query_vec = self.embed_text(query)
-    select_cols = ["photo_id", "photo_image_url", "description", "_distance"]
-
-    # Search 1: query text vector vs image vectors (cross-modal)
-    image_results = (
-        self.table.search(query_vec, vector_column_name="vector")
-        .metric("cosine")
-        .limit(k)
-        .select(select_cols)
-        .to_pandas()
+    photo_url = f"/images/{filename}"
+    record = ImageRecord(
+        photo_id=file_path.stem,
+        photo_image_url=photo_url,
+        description=description,
+        vector=vector,
+        caption_vector=caption_vector,
     )
-
-    # Search 2: query text vector vs caption vectors (same-modal)
-    caption_results = (
-        self.table.search(query_vec, vector_column_name="caption_vector")
-        .metric("cosine")
-        .limit(k)
-        .select(select_cols)
-        .to_pandas()
-    )
-
-    # Merge: for each image, keep the better (lower distance) match
-    best = {}
-    for df in [image_results, caption_results]:
-        if df.empty:
-            continue
-        for _, row in df.iterrows():
-            pid = row["photo_id"]
-            dist = row.get("_distance", 1.0)
-            if pid not in best or dist < best[pid]["_distance"]:
-                best[pid] = row.to_dict()
-
-    if not best:
-        return []
-
-    results = sorted(best.values(), key=lambda r: r["_distance"])
-    results = [r for r in results if r["_distance"] <= threshold]
-    return results[:k]
+    self._insert_records([record])
+    sync_to_repo()
+    return {"id": file_path.stem, "url": photo_url, "description": description, "status": "indexed"}
 ```
 
-- **Search 1 (cross-modal):** Text query vector compared against image embedding vectors. This is text-to-image matching. CLIP was trained to align text and images, but they are different modalities — max similarity is typically ~0.35.
-- **Search 2 (same-modal):** Text query vector compared against caption text vectors. This is text-to-text matching. Because both are text embeddings from CLIP's text encoder, similarity can reach 1.0 for exact matches.
-- **Merge strategy:** For each `photo_id`, keep whichever search gave the lower `_distance` (= better match). This means an image can match via either pathway.
-- **Threshold filter:** Removes results with distance above the threshold (default 0.9 = very permissive).
-- **`_distance`:** LanceDB automatically adds this column — it is the cosine distance between the query vector and the stored vector.
+- The 3-step pipeline: CLIP(image) → BLIP(image) → CLIP(caption text)
+- `sync_to_repo()` pushes to the HF Dataset repository after every upload (persistence)
 
-### F. Score Rescaling (`search.py`, lines 11-20)
+### H. Bulk CSV Ingestion (`ingestion_service.py`, lines 94-149)
 
 ```python
-CLIP_SIM_FLOOR = 0.40  # Below this = 0% (unrelated)
-CLIP_SIM_CEIL = 1.00   # Exact caption match = 100%
+def process_bulk_csv(self, csv_path, limit=100, generate_captions=False, max_workers=8, batch_size=16):
+    # Phase 1: Concurrent downloads (8 threads)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_download_image, pid, url): i for i, (pid, url) in enumerate(rows)}
+        for future in as_completed(futures):
+            photo_id, url, img = future.result()
+            downloaded.append((photo_id, url, img))
 
-def rescale_clip_score(raw_cosine_distance: float) -> float:
-    raw_sim = 1.0 - raw_cosine_distance      # Convert distance → similarity
-    scaled = (raw_sim - CLIP_SIM_FLOOR) / (CLIP_SIM_CEIL - CLIP_SIM_FLOOR)
-    return max(0.0, min(1.0, scaled))          # Clamp to [0, 1]
+    # Phase 2: Batch embed via CLIP (16 images per forward pass)
+    images = [img for _, _, img in downloaded]
+    vectors = search_service.embed_images_batch(images, batch_size=batch_size)
+
+    # Phase 3: Optional BLIP captioning
+    zero_vec = np.zeros(512, dtype="float32")
+    for i, (photo_id, url, img) in enumerate(downloaded):
+        description = ""
+        cap_vec = zero_vec
+        if generate_captions:
+            description = caption_service.generate_caption(img)
+            cap_vec = search_service.embed_text(description)
+        records.append(ImageRecord(...))
+
+    # Phase 4: Insert all at once
+    self._insert_records(records)
+
+    # Phase 5: Maybe build IVF-PQ index
+    self._maybe_create_index()
+
+    # Phase 6: Persist
+    sync_to_repo()
 ```
 
-**Why rescaling is necessary:**
-- Cosine distance ranges from 0.0 (identical) to 2.0 (opposite)
-- CLIP's actual output for cross-modal comparisons sits in a narrow band (~0.10-0.35 similarity)
-- After hybrid search, caption matches can reach 1.0 similarity
-- Without rescaling, a "good" match shows as 22% — users think the system is broken
-- The rescaling maps the actual useful range (0.40-1.00 similarity) to 0-100%
+- Captioning is OFF by default for bulk (`generate_captions=False`) — it takes ~200ms per image
+- When skipped, `caption_vector` is a zero vector (512 zeros) — hybrid search will ignore it
+- ThreadPoolExecutor downloads 8 images simultaneously (network-bound, not CPU-bound)
 
-**Worked examples:**
-| Raw Distance | Raw Similarity | Rescaled Score | Meaning |
-|:---|:---|:---|:---|
-| 0.00 | 1.00 | 100% | Perfect caption match |
-| 0.20 | 0.80 | 67% | Strong match |
-| 0.40 | 0.60 | 33% | Moderate match |
-| 0.60 | 0.40 | 0% | Below floor — filtered out |
-
-### G. Search API Endpoint (`search.py`, lines 34-56)
+### I. Upload Endpoints (`upload.py`, lines 1-66)
 
 ```python
-@router.post("/search", response_model=List[SearchResult])
-async def search_images(req: SearchRequest):
-    results = search_service.search(req.query, req.k, req.threshold)
-    response = []
-    for r in results:
-        dist = r.get("_distance", 1.0)
-        score = rescale_clip_score(dist)
-        url = r["photo_image_url"]
-        if url.startswith("/images/"):
-            url = f"{BACKEND_URL}{url}"
-        response.append({
-            "photo_id": r["photo_id"],
-            "photo_image_url": url,
-            "description": r.get("description", ""),
-            "score": float(score)
-        })
-    return response
+@router.post("/upload")
+async def upload_image(file: UploadFile):
+    result = ingestion_service.process_upload(await file.read(), file.filename)
+    # Returns: {id, url, description, status}
+
+@router.post("/ingest/url")
+async def ingest_url(req: UrlIngestRequest):
+    result = ingestion_service.process_url_upload(req.url, req.photo_id)
+
+@router.post("/ingest/bulk")
+async def bulk_ingest(req: BulkIngestRequest):
+    result = ingestion_service.process_bulk_csv(req.csv_path, req.limit, req.generate_captions)
+
+@router.delete("/clear-db")
+async def clear_database():
+    # Wipes the LanceDB table and syncs the empty state
 ```
-
-- Takes `SearchRequest` (query string, k limit, distance threshold)
-- Calls the hybrid search, rescales each result's distance to a percentage
-- Converts relative URLs (`/images/...`) to absolute URLs using `BACKEND_URL`
-- Returns a list of `SearchResult` objects with `photo_id`, `photo_image_url`, `description`, `score`
-
-### H. List All Indexed Images (`search.py`, lines 57-79)
-
-```python
-@router.get("/images/all")
-async def list_all_images():
-    table = search_service.table
-    if table is None:
-        return []
-    df = table.to_pandas()
-    results = []
-    for _, row in df.iterrows():
-        url = row.get("photo_image_url", "")
-        if isinstance(url, str) and url.startswith("/images/"):
-            url = f"{BACKEND_URL}{url}"
-        results.append({
-            "photo_id": row.get("photo_id", ""),
-            "photo_image_url": url,
-            "description": row.get("description", ""),
-        })
-    return results
-```
-
-- This endpoint powers the "All Images" gallery tab in the admin panel
-- Reads the entire LanceDB table into a pandas DataFrame
-- Returns every record with its ID, URL, and BLIP caption
-- No search involved — just a full table dump
-
-### I. Frontend Search Parameters (`page.tsx`, lines 24-31)
-
-```typescript
-const CLIP_FLOOR = 0.40;
-const CLIP_CEIL = 1.00;
-
-// Convert user's similarity slider (0-100%) to backend distance threshold
-const rawSim = CLIP_FLOOR + minSimilarity * (CLIP_CEIL - CLIP_FLOOR);
-const distanceThreshold = 1 - rawSim;
-```
-
-- The frontend mirrors the backend's rescaling constants
-- When user sets similarity slider to 50%, the backend receives a distance threshold
-- This ensures the slider and the displayed scores are consistent
-
-### J. Frontend API Client (`api.ts`, key functions)
-
-```typescript
-export async function searchImages(query: string, k: number, threshold: number) {
-    const res = await fetch(`${API_BASE}/search`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, k, threshold }),
-    });
-    return res.json();
-}
-
-export async function listAllImages() {
-    const res = await fetch(`${API_BASE}/images/all`);
-    return res.json();
-}
-```
-
-- `searchImages()` sends the query, max results (k), and distance threshold to your search endpoint
-- `listAllImages()` fetches every indexed image for the admin gallery tab
-
-### K. Persistence: Server Startup (`main.py`, lines 10-20)
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    restore_from_repo()  # Download LanceDB + images from HF Dataset repo
-    search_service.refresh_table()  # Load the table into memory
-    yield
-```
-
-- On startup, before accepting any requests, the server downloads persisted data from the HF Dataset repository
-- This is how the database survives server restarts on HF Spaces (which has ephemeral storage)
-- After restore, `refresh_table()` loads the LanceDB table so search works immediately
 
 ---
 
 ## Topic List: Everything You Need to Understand
 
-### LanceDB (The Vector Database)
-1. What LanceDB is (embedded, open-source vector database — like SQLite for vectors)
-2. How it differs from traditional databases (stores high-dimensional vectors, supports similarity search)
-3. How it differs from other vector databases (Pinecone is cloud-hosted, FAISS is a library not a DB — LanceDB is embedded with metadata support)
-4. The `ImageRecord` schema — what each of the 5 fields stores
-5. How records are inserted (`_insert_records` — try open, fall back to create)
-6. How the table is loaded at startup (`refresh_table`)
-7. What `lancedb.connect(uri)` does (opens or creates a database at the given path)
-8. How data persists across server restarts (HF Dataset repo sync)
+### CLIP (Contrastive Language-Image Pre-training)
+1. What CLIP is and who made it (OpenAI, 2021)
+2. How CLIP's dual-encoder architecture works (Vision Transformer for images, text Transformer for text)
+3. What "shared embedding space" means and why it enables cross-modal search
+4. What a 512-dimensional vector is and what each dimension represents (learned features, not human-interpretable)
+5. What L2 normalisation is and why we do it (unit vectors → cosine similarity = dot product)
+6. What `@torch.no_grad()` does and why we use it (inference only, no training)
+7. The difference between `get_text_features()` and `get_image_features()`
+8. What the LRU cache does and why it matters for performance
+9. What batch embedding is and why it is faster than one-at-a-time
+10. The `pooler_output` compatibility issue with newer `transformers` versions
 
-### Cosine Distance & Similarity
-9. What cosine distance is (measures the angle between two vectors — 0 = identical, 2 = opposite)
-10. The relationship between distance and similarity: `similarity = 1 - distance`
-11. Why we use cosine distance instead of Euclidean distance (works better for normalised embeddings, invariant to vector magnitude)
-12. Why all vectors are L2-normalised before storage (ensures cosine similarity = dot product, more efficient)
-13. Why CLIP's cross-modal similarity is low (~0.20-0.35) even for good matches
-14. Why same-modal similarity (text vs text caption) can reach 1.0
+### BLIP (Bootstrapping Language-Image Pre-training)
+11. What BLIP is and who made it (Salesforce, 2022)
+12. How BLIP differs from CLIP (generates text vs generates vectors)
+13. Why we need BLIP in addition to CLIP (human-readable captions, hybrid search, accessibility)
+14. The specific model variant we use (`blip-image-captioning-base`, ~990MB)
+15. The singleton pattern and why only one instance exists
+16. Lazy loading — why the model loads on first use, not at startup
+17. Why the import statement is inside `_ensure_loaded()` not at the top of the file
+18. The RGB conversion guard and why it is needed
+19. Known BLIP quality issues (repetition loops, shallow descriptions)
+20. Why we chose BLIP over Gemini (CLIP compatibility, speed, no external dependency)
 
-### The Hybrid Search Algorithm
-15. What "hybrid search" means in this system (dual-vector search, not keyword + vector)
-16. Search 1: query vs image vectors — what it captures (visual similarity)
-17. Search 2: query vs caption vectors — what it captures (semantic/textual similarity)
-18. The merge strategy: per-`photo_id`, keep the lower distance
-19. Why the merge uses "best of two" instead of averaging (averaging would weaken strong single-pathway matches)
-20. The threshold filter — what it does and what the default 0.9 means
-21. How results are sorted (ascending by distance = best match first)
-22. What happens for uncaptioned images (zero vector → caption search returns high distance → image search pathway still works)
-
-### Score Rescaling
-23. Why raw cosine similarity cannot be shown to users (22% for a correct match looks broken)
-24. The CLIP_SIM_FLOOR (0.40) and CLIP_SIM_CEIL (1.00) — what they represent
-25. The rescaling formula: `(similarity - floor) / (ceil - floor)`, clamped to [0, 1]
-26. How the frontend slider maps back to a distance threshold
-27. Why the constants changed from 0.10/0.35 to 0.40/1.00 (hybrid search shifted the output range)
-
-### IVF-PQ Indexing
-28. What IVF means (Inverted File Index — divides vector space into partitions/clusters)
-29. What PQ means (Product Quantisation — compresses vectors by splitting into sub-vectors)
-30. How IVF-PQ makes search faster (only scan nearest partitions instead of all rows)
-31. Why the index is only created at 256+ rows (overhead not worth it for small tables)
-32. Why `num_partitions = sqrt(row_count)` (standard heuristic balancing granularity vs overhead)
-33. Why `num_sub_vectors = 16` (512 dims / 16 = 32 dims per sub-vector)
-34. The trade-off: IVF-PQ is approximate — it may miss some results that brute-force would find
-
-### The `/images/all` Endpoint
-35. What the "All Images" gallery tab shows (every indexed image with its BLIP caption)
-36. How it works technically (full table dump to pandas DataFrame)
-37. Why this is useful for admins (verify captions, check database contents, spot-check BLIP output)
+### The Ingestion Pipeline
+21. The 3-step pipeline: CLIP(image) → BLIP(image) → CLIP(caption)
+22. Why two vectors are stored per image (hybrid search — visual + textual matching)
+23. The ImageRecord schema (5 fields, 2 vector columns)
+24. How single file upload works (synchronous, always captioned)
+25. How URL ingestion works (downloads image first, then same pipeline)
+26. How bulk CSV ingestion works (6 phases: download → embed → caption → insert → index → persist)
+27. Why captioning is optional for bulk (speed — ~200ms per image adds up)
+28. What happens when captions are skipped (zero vector → caption search returns nothing for that image)
+29. Concurrent downloading with ThreadPoolExecutor (8 workers, network-bound)
+30. `sync_to_repo()` — background persistence to HF Dataset repository
 
 ---
 
 ## 10 Questions You Must Be Able to Answer
 
-1. **What database does the system use and why was it chosen over alternatives?**
-2. **What is cosine distance and how does it relate to similarity?**
-3. **Walk me through what happens when a user searches for "elephant crossing" — from the moment they hit Enter to the moment results appear.**
-4. **What is hybrid search and why does it produce better results than single-vector search?**
-5. **Why do we rescale the scores, and what would happen if we showed raw similarity values?**
-6. **What is the IVF-PQ index, and why is it only created when we have 256+ images?**
-7. **What is the difference between Search 1 (image vectors) and Search 2 (caption vectors)?**
-8. **How does the system handle images that were bulk-ingested without captions?**
-9. **How does the LanceDB data survive server restarts on Hugging Face Spaces?**
-10. **What does the "All Images" tab in the admin panel show, and what endpoint does it call?**
+1. **What AI model generates the image embeddings, and what is the output?**
+2. **What AI model generates the image captions, and give an example of its output?**
+3. **Walk me through what happens step-by-step when a user uploads a single image.**
+4. **Why do we store two vectors per image instead of one?**
+5. **What is the LRU cache and why does it improve performance?**
+6. **Why is BLIP lazy-loaded instead of loading at server startup?**
+7. **How does bulk ingestion differ from single upload? Name three specific optimisations.**
+8. **Why did we choose BLIP over Google Gemini for captioning?**
+9. **What does `@torch.no_grad()` do and why is it on every embedding method?**
+10. **What is L2 normalisation and why do we apply it to every vector?**
